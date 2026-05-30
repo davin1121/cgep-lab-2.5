@@ -16,6 +16,8 @@ The result is compliance evidence with three properties auditors require:
 | **Attribution** | `commit.txt` captures the exact git commit, author, and timestamp |
 | **Reproducibility** | `plan.json` and `state.json` show exactly what Terraform planned and deployed |
 
+## Architecture
+
 ```
 Lab 2.3 workspace          capture-evidence.sh            Object Lock Vault
 ─────────────────          ───────────────────            ─────────────────
@@ -46,19 +48,19 @@ The answer is the S3 VersionId in `receipt.json` — an immutable, AWS-generated
 
 ## 3. Key design decisions
 
-**GOVERNANCE mode, not COMPLIANCE.** COMPLIANCE mode cannot be bypassed by anyone — including account root — until the retention period expires. For a lab environment, this would make cleanup impossible without waiting days. GOVERNANCE mode allows bypass with explicit intent (`--bypass-governance-retention`) and a privileged IAM role, which is appropriate for testing. A real production evidence vault should use COMPLIANCE.
+**GOVERNANCE mode, not COMPLIANCE.** COMPLIANCE mode cannot be bypassed by anyone — including account root — until the retention period expires. For a lab environment, this would make cleanup impossible without waiting days. GOVERNANCE mode allows bypass with explicit intent (`--bypass-governance-retention`) and a privileged IAM role. A real production evidence vault should use COMPLIANCE.
 
-**SHA-256 manifest over the bundle, not just the bundle.** Rather than hashing only the `bundle.tar.gz`, the capture script hashes each individual file before packaging and writes a `manifest.json` inside the bundle. This means even if the tar format changed, individual file integrity can be verified. An auditor can open the bundle, hash any file inside it, and compare against `manifest.json` without re-running the script.
+**SHA-256 manifest over individual files, not just the bundle.** The capture script hashes each file before packaging and writes a `manifest.json` inside the bundle. An auditor can open the bundle, hash any file, and compare against `manifest.json` without re-running the script.
 
-**VersionId as the receipt anchor.** S3 generates a VersionId the moment an object is written. This ID is tied to the exact bytes stored — if even one bit changes, the VersionId changes. Storing the VersionId in `receipt.json` creates an unforgeable pointer from the receipt to the evidence. The receipt itself is committed to git, creating a second chain of custody.
+**VersionId as the receipt anchor.** S3 generates a VersionId the moment an object is written, tied to the exact bytes stored. Storing it in `receipt.json` creates an unforgeable pointer from the receipt to the evidence. The receipt is then committed to git, creating a second chain of custody.
 
-**Bucket policy denies `s3:DeleteBucket` to all principals.** Object Lock protects objects but not the bucket itself. The bucket policy adds a second layer: even a privileged IAM user cannot delete the vault bucket without modifying the policy first, which leaves a CloudTrail event.
+**Bucket policy denies `s3:DeleteBucket` to all principals.** Object Lock protects objects but not the bucket itself. The bucket policy adds a second layer — even a privileged IAM user cannot delete the vault without modifying the policy first, which leaves a CloudTrail event.
 
 ---
 
 ## 4. Results
 
-After running `capture-evidence.sh`, the vault contains a locked bundle and the script outputs a receipt:
+After running `capture-evidence.sh`, the vault contains a locked bundle and the script outputs:
 
 ```json
 {
@@ -70,14 +72,13 @@ After running `capture-evidence.sh`, the vault contains a locked bundle and the 
 }
 ```
 
-Destructive test result — attempting to delete the locked object:
+Destructive test — attempting to delete the locked object returns:
 ```
 An error occurred (AccessDenied) when calling the DeleteObject operation:
-User is not authorized to perform s3:DeleteObject on this resource because
 Object Lock is enabled.
 ```
 
-This `AccessDenied` is the proof of immutability. It is saved as part of the portfolio.
+This `AccessDenied` is the proof of immutability.
 
 ---
 
@@ -85,7 +86,10 @@ This `AccessDenied` is the proof of immutability. It is saved as part of the por
 
 **Prerequisites:** Terraform >= 1.6, AWS CLI v2, Bash (Git Bash on Windows), a completed Lab 2.3 workspace.
 
-**Deploy the vault:**
+## Usage
+
+### 1. Deploy the vault
+
 ```bash
 cd terraform/primitives/evidence-vault
 terraform init
@@ -93,33 +97,63 @@ terraform apply -auto-approve
 VAULT=$(terraform output -raw vault_name)
 ```
 
-**Capture evidence:**
+### 2. Capture evidence from a Terraform workspace
+
 ```bash
 bash scripts/capture-evidence.sh \
-  --workspace <path-to-lab-2.3-terraform-workspace> \
+  --workspace <path-to-terraform-workspace> \
   --run-id    test-001 \
   --vault     "$VAULT" \
-  --profile   default
+  --profile   <aws-profile>
 ```
 
-Save the receipt output to `evidence/lab-2-5/receipt.json`.
+The script outputs a single-line JSON receipt:
 
-**Verify Object Lock:**
-```bash
-aws s3api get-object-lock-configuration --bucket "$VAULT" --profile default
-aws s3api get-object-retention --bucket "$VAULT" --key runs/test-001/bundle.tar.gz --profile default
+```json
+{
+  "run_id": "test-001",
+  "vault": "cgep-lab-grc-evidence-vault-XXXXXXXX",
+  "key": "runs/test-001/bundle.tar.gz",
+  "version_id": "<s3-version-id>",
+  "captured_at_utc": "<iso-utc-timestamp>"
+}
 ```
 
-**Destructive test (expect AccessDenied):**
+Save this to `evidence/lab-2-5/receipt.json`.
+
+### 3. Verify Object Lock
+
 ```bash
-aws s3api delete-object --bucket "$VAULT" --key runs/test-001/bundle.tar.gz \
-  --version-id "<version-id>" --profile default
+# Bucket-level lock configuration
+aws s3api get-object-lock-configuration --bucket "$VAULT" --profile <profile>
+
+# Object-level retention
+aws s3api get-object-retention \
+  --bucket "$VAULT" \
+  --key runs/test-001/bundle.tar.gz \
+  --profile <profile>
 ```
 
-**Cleanup (GOVERNANCE bypass):**
+### 4. Proof of immutability (destructive test)
+
 ```bash
-aws s3api delete-object --bucket "$VAULT" --key runs/test-001/bundle.tar.gz \
-  --version-id "<version-id>" --bypass-governance-retention --profile default
+aws s3api delete-object \
+  --bucket "$VAULT" \
+  --key runs/test-001/bundle.tar.gz \
+  --version-id "<version-id>" \
+  --profile <profile>
+# Expected: AccessDenied because object protected by object lock
+```
+
+### 5. Cleanup (GOVERNANCE mode only)
+
+```bash
+aws s3api delete-object \
+  --bucket "$VAULT" \
+  --key runs/test-001/bundle.tar.gz \
+  --version-id "<version-id>" \
+  --bypass-governance-retention \
+  --profile <profile>
 
 cd terraform/primitives/evidence-vault
 terraform destroy -auto-approve
